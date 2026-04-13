@@ -1,0 +1,318 @@
+"""
+PlantPulse - Trends API
+Vercel serverless function that fetches real Google Trends data
+for a list of plant names filtered by US region (state).
+"""
+
+from http.server import BaseHTTPRequestHandler
+import json
+import time
+import urllib.parse
+
+# pytrends is included in requirements.txt
+try:
+    from pytrends.request import TrendReq
+except ImportError:
+    TrendReq = None
+
+
+# ---------------------------------------------------------------------------
+# Plant name lookup table
+# Maps common names to botanical names and search term variants.
+# Common names are used for Google Trends queries because that is what
+# consumers actually search for. Botanical names are returned for display.
+# ---------------------------------------------------------------------------
+PLANT_LOOKUP = {
+    # Shrubs & Trees
+    "Hydrangea": {"botanical": "Hydrangea macrophylla", "aliases": ["hydrangea shrub", "hydrangeas"]},
+    "Incrediball Hydrangea": {"botanical": "Hydrangea arborescens 'Incrediball'", "aliases": ["incrediball hydrangea"]},
+    "Limelight Hydrangea": {"botanical": "Hydrangea paniculata 'Limelight'", "aliases": ["limelight hydrangea"]},
+    "Little Lime Hydrangea": {"botanical": "Hydrangea paniculata 'Jane'", "aliases": ["little lime hydrangea"]},
+    "Endless Summer Hydrangea": {"botanical": "Hydrangea macrophylla 'Bailmer'", "aliases": ["endless summer hydrangea"]},
+    "Annabelle Hydrangea": {"botanical": "Hydrangea arborescens 'Annabelle'", "aliases": ["annabelle hydrangea"]},
+    "Boxwood": {"botanical": "Buxus sempervirens", "aliases": ["boxwood shrub", "buxus"]},
+    "Arborvitae": {"botanical": "Thuja occidentalis", "aliases": ["arborvitae tree", "thuja"]},
+    "Emerald Green Arborvitae": {"botanical": "Thuja occidentalis 'Smaragd'", "aliases": ["emerald green arborvitae"]},
+    "Burning Bush": {"botanical": "Euonymus alatus", "aliases": ["burning bush shrub"]},
+    "Spirea": {"botanical": "Spiraea japonica", "aliases": ["spirea shrub", "spiraea"]},
+    "Double Play Spirea": {"botanical": "Spiraea japonica 'SMNSJMFP'", "aliases": ["double play spirea"]},
+    "Knock Out Rose": {"botanical": "Rosa 'Radrazz'", "aliases": ["knockout rose", "knock out roses"]},
+    "Drift Rose": {"botanical": "Rosa 'Meidrifora'", "aliases": ["drift rose", "drift roses"]},
+    "Lilac": {"botanical": "Syringa vulgaris", "aliases": ["lilac bush", "lilac tree"]},
+    "Bloomerang Lilac": {"botanical": "Syringa 'SMSJBP7'", "aliases": ["bloomerang lilac"]},
+    "Weigela": {"botanical": "Weigela florida", "aliases": ["weigela shrub"]},
+    "My Monet Weigela": {"botanical": "Weigela florida 'Verweig'", "aliases": ["my monet weigela"]},
+    "Forsythia": {"botanical": "Forsythia x intermedia", "aliases": ["forsythia bush", "forsythia shrub"]},
+    "Viburnum": {"botanical": "Viburnum opulus", "aliases": ["viburnum shrub", "viburnum bush"]},
+    "Ninebark": {"botanical": "Physocarpus opulifolius", "aliases": ["ninebark shrub", "physocarpus"]},
+    "Coppertina Ninebark": {"botanical": "Physocarpus opulifolius 'Mindia'", "aliases": ["coppertina ninebark"]},
+    "Diablo Ninebark": {"botanical": "Physocarpus opulifolius 'Monlo'", "aliases": ["diablo ninebark"]},
+    "Serviceberry": {"botanical": "Amelanchier canadensis", "aliases": ["serviceberry tree", "amelanchier"]},
+    "Redbud": {"botanical": "Cercis canadensis", "aliases": ["redbud tree", "eastern redbud"]},
+    "Dogwood": {"botanical": "Cornus florida", "aliases": ["dogwood tree", "flowering dogwood"]},
+    "Pagoda Dogwood": {"botanical": "Cornus alternifolia", "aliases": ["pagoda dogwood"]},
+    "Crabapple": {"botanical": "Malus hybrid", "aliases": ["crabapple tree", "flowering crabapple"]},
+    "Japanese Maple": {"botanical": "Acer palmatum", "aliases": ["japanese maple tree"]},
+    "Ornamental Grass": {"botanical": "Miscanthus sinensis", "aliases": ["ornamental grass", "miscanthus"]},
+    "Karl Foerster Grass": {"botanical": "Calamagrostis x acutiflora 'Karl Foerster'", "aliases": ["karl foerster grass"]},
+    "Switchgrass": {"botanical": "Panicum virgatum", "aliases": ["switchgrass", "panicum"]},
+    "Elderberry": {"botanical": "Sambucus canadensis", "aliases": ["elderberry shrub", "sambucus"]},
+    "Black Lace Elderberry": {"botanical": "Sambucus nigra 'Eva'", "aliases": ["black lace elderberry"]},
+    "Itea": {"botanical": "Itea virginica", "aliases": ["itea shrub", "virginia sweetspire"]},
+    "Fothergilla": {"botanical": "Fothergilla gardenii", "aliases": ["fothergilla shrub"]},
+    "Buttonbush": {"botanical": "Cephalanthus occidentalis", "aliases": ["buttonbush shrub"]},
+    # Annuals
+    "Petunia": {"botanical": "Petunia x hybrida", "aliases": ["petunia flower", "petunias"]},
+    "Wave Petunia": {"botanical": "Petunia x hybrida 'Wave'", "aliases": ["wave petunia"]},
+    "Marigold": {"botanical": "Tagetes patula", "aliases": ["marigold flower", "marigolds"]},
+    "Zinnia": {"botanical": "Zinnia elegans", "aliases": ["zinnia flower", "zinnias"]},
+    "Impatiens": {"botanical": "Impatiens walleriana", "aliases": ["impatiens flower"]},
+    "SunPatiens": {"botanical": "Impatiens x hybrida 'SunPatiens'", "aliases": ["sunpatiens"]},
+    "Begonia": {"botanical": "Begonia x semperflorens", "aliases": ["begonia flower", "wax begonia"]},
+    "Coleus": {"botanical": "Solenostemon scutellarioides", "aliases": ["coleus plant", "coleus"]},
+    "Lantana": {"botanical": "Lantana camara", "aliases": ["lantana flower", "lantana plant"]},
+    "Vinca": {"botanical": "Catharanthus roseus", "aliases": ["vinca flower", "annual vinca"]},
+    "Angelonia": {"botanical": "Angelonia angustifolia", "aliases": ["angelonia flower", "summer snapdragon"]},
+    "Calibrachoa": {"botanical": "Calibrachoa x hybrida", "aliases": ["calibrachoa", "million bells"]},
+    "Million Bells": {"botanical": "Calibrachoa x hybrida", "aliases": ["million bells flower"]},
+    "Geranium": {"botanical": "Pelargonium x hortorum", "aliases": ["geranium flower", "annual geranium"]},
+    "Salvia": {"botanical": "Salvia splendens", "aliases": ["salvia flower", "annual salvia"]},
+    "Verbena": {"botanical": "Verbena x hybrida", "aliases": ["verbena flower", "annual verbena"]},
+    "Celosia": {"botanical": "Celosia argentea", "aliases": ["celosia flower", "cockscomb"]},
+    "Snapdragon": {"botanical": "Antirrhinum majus", "aliases": ["snapdragon flower", "snapdragons"]},
+    "Dusty Miller": {"botanical": "Senecio cineraria", "aliases": ["dusty miller plant"]},
+    "Sweet Potato Vine": {"botanical": "Ipomoea batatas", "aliases": ["sweet potato vine", "ipomoea vine"]},
+    # Perennials
+    "Coneflower": {"botanical": "Echinacea purpurea", "aliases": ["coneflower", "echinacea"]},
+    "Black-Eyed Susan": {"botanical": "Rudbeckia fulgida", "aliases": ["black eyed susan", "rudbeckia"]},
+    "Daylily": {"botanical": "Hemerocallis hybrid", "aliases": ["daylily flower", "daylilies"]},
+    "Hosta": {"botanical": "Hosta hybrid", "aliases": ["hosta plant", "hostas"]},
+    "Astilbe": {"botanical": "Astilbe x arendsii", "aliases": ["astilbe flower"]},
+    "Coreopsis": {"botanical": "Coreopsis grandiflora", "aliases": ["coreopsis flower", "tickseed"]},
+    "Salvia Perennial": {"botanical": "Salvia nemorosa", "aliases": ["perennial salvia", "salvia nemorosa"]},
+    "Ornamental Sage": {"botanical": "Salvia x sylvestris", "aliases": ["may night salvia", "caradonna salvia"]},
+    "Sedum": {"botanical": "Hylotelephium spectabile", "aliases": ["sedum plant", "stonecrop"]},
+    "Autumn Joy Sedum": {"botanical": "Hylotelephium 'Herbstfreude'", "aliases": ["autumn joy sedum"]},
+    "Catmint": {"botanical": "Nepeta x faassenii", "aliases": ["catmint plant", "nepeta"]},
+    "Bee Balm": {"botanical": "Monarda didyma", "aliases": ["bee balm flower", "monarda"]},
+    "Russian Sage": {"botanical": "Perovskia atriplicifolia", "aliases": ["russian sage plant"]},
+    "Gaura": {"botanical": "Oenothera lindheimeri", "aliases": ["gaura plant", "whirling butterflies"]},
+    "Coreopsis Moonbeam": {"botanical": "Coreopsis verticillata 'Moonbeam'", "aliases": ["moonbeam coreopsis"]},
+    "Heuchera": {"botanical": "Heuchera hybrid", "aliases": ["heuchera plant", "coral bells"]},
+    "Coral Bells": {"botanical": "Heuchera hybrid", "aliases": ["coral bells plant", "heuchera"]},
+    "Phlox": {"botanical": "Phlox paniculata", "aliases": ["garden phlox", "phlox flower"]},
+    "Liatris": {"botanical": "Liatris spicata", "aliases": ["liatris flower", "blazing star"]},
+    "Veronica": {"botanical": "Veronica spicata", "aliases": ["veronica flower", "speedwell"]},
+    # Natives
+    "Milkweed": {"botanical": "Asclepias tuberosa", "aliases": ["butterfly milkweed", "asclepias"]},
+    "Common Milkweed": {"botanical": "Asclepias syriaca", "aliases": ["common milkweed", "milkweed plant"]},
+    "Wild Bergamot": {"botanical": "Monarda fistulosa", "aliases": ["wild bergamot", "native bee balm"]},
+    "Prairie Dropseed": {"botanical": "Sporobolus heterolepis", "aliases": ["prairie dropseed grass"]},
+    "Little Bluestem": {"botanical": "Schizachyrium scoparium", "aliases": ["little bluestem grass"]},
+    "Purple Coneflower": {"botanical": "Echinacea purpurea", "aliases": ["purple coneflower", "native echinacea"]},
+    "Wild Ginger": {"botanical": "Asarum canadense", "aliases": ["wild ginger plant"]},
+    "Joe Pye Weed": {"botanical": "Eutrochium purpureum", "aliases": ["joe pye weed", "eutrochium"]},
+    "Goldenrod": {"botanical": "Solidago speciosa", "aliases": ["goldenrod plant", "solidago"]},
+    "New England Aster": {"botanical": "Symphyotrichum novae-angliae", "aliases": ["new england aster", "native aster"]},
+    "Prairie Blazing Star": {"botanical": "Liatris pycnostachya", "aliases": ["prairie blazing star", "prairie liatris"]},
+    "Blue Wild Indigo": {"botanical": "Baptisia australis", "aliases": ["blue wild indigo", "baptisia"]},
+    "Wild Columbine": {"botanical": "Aquilegia canadensis", "aliases": ["wild columbine", "native columbine"]},
+    "Cardinal Flower": {"botanical": "Lobelia cardinalis", "aliases": ["cardinal flower", "native lobelia"]},
+    "Native Grasses Mix": {"botanical": "Panicum / Schizachyrium / Sporobolus", "aliases": ["native grasses", "prairie grasses"]},
+}
+
+# Category to plant name mapping
+CATEGORY_PLANTS = {
+    "shrubs": [
+        "Hydrangea", "Incrediball Hydrangea", "Limelight Hydrangea", "Little Lime Hydrangea",
+        "Endless Summer Hydrangea", "Knock Out Rose", "Drift Rose", "Lilac", "Bloomerang Lilac",
+        "Spirea", "Double Play Spirea", "Weigela", "Forsythia", "Ninebark", "Coppertina Ninebark",
+        "Diablo Ninebark", "Viburnum", "Serviceberry", "Redbud", "Crabapple",
+        "Elderberry", "Black Lace Elderberry", "Itea", "Fothergilla", "Buttonbush",
+        "Arborvitae", "Emerald Green Arborvitae", "Japanese Maple", "Dogwood", "Pagoda Dogwood",
+    ],
+    "annuals": [
+        "Petunia", "Wave Petunia", "Marigold", "Zinnia", "Impatiens", "SunPatiens",
+        "Begonia", "Coleus", "Lantana", "Vinca", "Angelonia", "Million Bells",
+        "Geranium", "Salvia", "Verbena", "Celosia", "Snapdragon", "Sweet Potato Vine",
+    ],
+    "perennials": [
+        "Coneflower", "Black-Eyed Susan", "Daylily", "Hosta", "Astilbe", "Coreopsis",
+        "Ornamental Sage", "Sedum", "Autumn Joy Sedum", "Catmint", "Bee Balm",
+        "Russian Sage", "Heuchera", "Coral Bells", "Phlox", "Liatris", "Veronica",
+    ],
+    "natives": [
+        "Milkweed", "Common Milkweed", "Wild Bergamot", "Prairie Dropseed", "Little Bluestem",
+        "Purple Coneflower", "Joe Pye Weed", "Goldenrod", "New England Aster",
+        "Prairie Blazing Star", "Blue Wild Indigo", "Wild Columbine", "Cardinal Flower",
+        "Native Grasses Mix",
+    ],
+}
+
+# ---------------------------------------------------------------------------
+# Hardiness zone data by US state (USDA 2023 map, predominant zones)
+# Used as fallback when zip code USDA API lookup is unavailable.
+# ZIP-level accuracy is handled by the /api/zone endpoint.
+# ---------------------------------------------------------------------------
+STATE_ZONES = {
+    "AL": "7b-8a", "AK": "1a-7b", "AZ": "5a-10b", "AR": "6b-8a",
+    "CA": "5a-11a", "CO": "3b-7a", "CT": "6a-7a", "DE": "7a-7b",
+    "FL": "8a-11a", "GA": "7a-9a", "HI": "9b-12b", "ID": "4a-7a",
+    "IL": "5a-7a", "IN": "5a-6b", "IA": "4b-6a", "KS": "5b-7a",
+    "KY": "6a-7a", "LA": "8a-9b", "ME": "3b-6a", "MD": "6a-8a",
+    "MA": "5b-7a", "MI": "4a-6b", "MN": "3b-5b", "MS": "7b-9a",
+    "MO": "5b-7a", "MT": "3a-5b", "NE": "4b-6a", "NV": "4a-10a",
+    "NH": "4a-6a", "NJ": "6a-7b", "NM": "4a-9a", "NY": "4a-7b",
+    "NC": "6a-8b", "ND": "3a-4b", "OH": "5b-7a", "OK": "6a-8a",
+    "OR": "4b-9b", "PA": "5b-7a", "RI": "6a-7a", "SC": "7a-9a",
+    "SD": "3b-5b", "TN": "6a-8a", "TX": "6a-10a", "UT": "4a-9a",
+    "VT": "3b-6a", "VA": "5b-8a", "WA": "4a-9b", "WV": "5a-7a",
+    "WI": "3b-5b", "WY": "3a-6a", "DC": "7a-7b",
+}
+
+
+def fetch_trends_data(plant_names, state_code, retries=3, backoff=2.0):
+    """
+    Fetch Google Trends interest over time for a list of plant names,
+    geo-filtered to the given US state. Returns a dict of plant_name -> score.
+    Handles rate limiting with exponential backoff.
+    pytrends accepts max 5 keywords per request so we batch accordingly.
+    """
+    if TrendReq is None:
+        raise RuntimeError("pytrends is not installed")
+
+    results = {}
+    geo = f"US-{state_code}"
+
+    # Batch into groups of 5 (pytrends limit)
+    batches = [plant_names[i:i+5] for i in range(0, len(plant_names), 5)]
+
+    pytrends = TrendReq(hl="en-US", tz=360, timeout=(10, 25), retries=2, backoff_factor=0.5)
+
+    for batch in batches:
+        for attempt in range(retries):
+            try:
+                pytrends.build_payload(
+                    batch,
+                    cat=0,
+                    timeframe="today 3-m",
+                    geo=geo,
+                    gprop=""
+                )
+                interest_df = pytrends.interest_over_time()
+
+                if interest_df.empty:
+                    for name in batch:
+                        results[name] = {"score": 0, "slope": "insufficient_data"}
+                else:
+                    for name in batch:
+                        if name in interest_df.columns:
+                            series = interest_df[name].dropna()
+                            if len(series) >= 4:
+                                score = int(series.mean())
+                                # Calculate slope: compare last quarter vs first quarter of period
+                                half = len(series) // 2
+                                first_half_avg = series.iloc[:half].mean()
+                                second_half_avg = series.iloc[half:].mean()
+                                delta = second_half_avg - first_half_avg
+                                if delta > 8:
+                                    slope = "rising"
+                                elif delta > 3:
+                                    slope = "climbing"
+                                elif delta < -8:
+                                    slope = "falling"
+                                elif delta < -3:
+                                    slope = "declining"
+                                else:
+                                    slope = "stable"
+                            else:
+                                score = 0
+                                slope = "insufficient_data"
+                            results[name] = {"score": score, "slope": slope}
+                        else:
+                            results[name] = {"score": 0, "slope": "no_data"}
+
+                # Respect rate limits between batches
+                time.sleep(1.5)
+                break  # Success, exit retry loop
+
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(backoff * (attempt + 1))
+                else:
+                    # On final failure, mark all plants in batch as unavailable
+                    for name in batch:
+                        results[name] = {"score": 0, "slope": "fetch_error", "error": str(e)}
+
+    return results
+
+
+def handler(request):
+    """
+    Vercel serverless handler.
+    Expects GET params: category, state
+    Returns JSON with trend scores for the plant list for that category/state.
+    """
+    # Parse query params
+    parsed = urllib.parse.urlparse(request.path)
+    params = urllib.parse.parse_qs(urllib.parse.urlparse(
+        request.path + "?" + (request.query_string.decode() if hasattr(request, "query_string") else "")
+    ).query)
+
+    category = params.get("category", ["shrubs"])[0].lower()
+    state = params.get("state", ["MN"])[0].upper()
+
+    # Validate inputs
+    if category not in CATEGORY_PLANTS:
+        category = "shrubs"
+    if state not in STATE_ZONES:
+        state = "MN"
+
+    plant_names = CATEGORY_PLANTS[category]
+    zone = STATE_ZONES.get(state, "5a")
+
+    try:
+        trend_data = fetch_trends_data(plant_names, state)
+
+        # Enrich with botanical names and filter out zero-score plants
+        enriched = []
+        for name, data in trend_data.items():
+            if data.get("slope") in ("fetch_error", "insufficient_data", "no_data") and data.get("score", 0) == 0:
+                continue
+            lookup = PLANT_LOOKUP.get(name, {})
+            enriched.append({
+                "commonName": name,
+                "botanicalName": lookup.get("botanical", ""),
+                "trendScore": data.get("score", 0),
+                "slope": data.get("slope", "stable"),
+            })
+
+        # Sort by trend score descending
+        enriched.sort(key=lambda x: x["trendScore"], reverse=True)
+
+        response_body = json.dumps({
+            "success": True,
+            "state": state,
+            "zone": zone,
+            "category": category,
+            "plants": enriched,
+        })
+
+    except Exception as e:
+        response_body = json.dumps({
+            "success": False,
+            "error": str(e),
+            "state": state,
+            "zone": zone,
+            "category": category,
+            "plants": [],
+        })
+
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
+        "body": response_body,
+    }
